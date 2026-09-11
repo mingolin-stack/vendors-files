@@ -23,14 +23,22 @@ def get_drive_service(service_account_info: dict):
     creds = service_account.Credentials.from_service_account_info(
         service_account_info, scopes=SCOPES
     )
-    return build("drive", "v3", credentials=creds)
+    # cache_discovery=False：避免在雲端容器這種唯讀/暫時性檔案系統上，
+    # googleapiclient 嘗試寫入本機探索快取檔案時發生額外的警告或錯誤。
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+# 遇到暫時性的網路/連線問題(BrokenPipeError、連線中斷等)時，自動重試的次數。
+# googleapiclient 的 execute(num_retries=...) 內建會針對這類暫時性錯誤自動重試，
+# 不需要我們自己額外寫重試迴圈。
+NUM_RETRIES = 3
 
 
 def find_file_id(service, folder_id: str, filename: str):
     """在指定資料夾裡尋找檔名完全相符的檔案，回傳 file_id，找不到回傳 None。"""
     safe_name = filename.replace("'", "\\'")
     query = f"'{folder_id}' in parents and name = '{safe_name}' and trashed = false"
-    results = service.files().list(q=query, fields="files(id, name)").execute()
+    results = service.files().list(q=query, fields="files(id, name)").execute(num_retries=NUM_RETRIES)
     files = results.get("files", [])
     return files[0]["id"] if files else None
 
@@ -42,7 +50,7 @@ def find_or_create_folder(service, parent_folder_id: str, folder_name: str) -> s
         f"'{parent_folder_id}' in parents and name = '{safe_name}' "
         f"and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
     )
-    results = service.files().list(q=query, fields="files(id, name)").execute()
+    results = service.files().list(q=query, fields="files(id, name)").execute(num_retries=NUM_RETRIES)
     files = results.get("files", [])
     if files:
         return files[0]["id"]
@@ -52,7 +60,7 @@ def find_or_create_folder(service, parent_folder_id: str, folder_name: str) -> s
         "mimeType": "application/vnd.google-apps.folder",
         "parents": [parent_folder_id],
     }
-    folder = service.files().create(body=metadata, fields="id").execute()
+    folder = service.files().create(body=metadata, fields="id").execute(num_retries=NUM_RETRIES)
     return folder["id"]
 
 
@@ -62,7 +70,7 @@ def download_file_bytes(service, file_id: str) -> bytes:
     downloader = MediaIoBaseDownload(buffer, request)
     done = False
     while not done:
-        _, done = downloader.next_chunk()
+        _, done = downloader.next_chunk(num_retries=NUM_RETRIES)
     buffer.seek(0)
     return buffer.read()
 
@@ -80,9 +88,9 @@ def upload_or_update_xlsx(service, folder_id: str, filename: str, file_bytes: by
     )
     existing_id = find_file_id(service, folder_id, filename)
     if existing_id:
-        service.files().update(fileId=existing_id, media_body=media).execute()
+        service.files().update(fileId=existing_id, media_body=media).execute(num_retries=NUM_RETRIES)
         return existing_id
     else:
         metadata = {"name": filename, "parents": [folder_id]}
-        created = service.files().create(body=metadata, media_body=media, fields="id").execute()
+        created = service.files().create(body=metadata, media_body=media, fields="id").execute(num_retries=NUM_RETRIES)
         return created["id"]

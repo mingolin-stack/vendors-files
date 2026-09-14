@@ -1,218 +1,172 @@
-"""
-供應商資料表 PDF 掃描辨識工具 (Streamlit)
-------------------------------------------------
-流程：
-  1. 上傳一份已掃描的供應商資料表 PDF
-  2. 程式自動辨識(文字欄位用 Google Vision API，勾選框用像素判斷)
-  3. 畫面顯示「裁切小圖 + 辨識建議值」，同仁快速核對、修正
-  4. 按下確認，資料寫入：
-       - 該供應商自己的主檔(Google Drive「供應商主檔」資料夾內，以統編/公司名建檔，每次提交新增一列)
-       - 彙總總表(同資料夾內 彙總總表.xlsx，每家供應商固定一列，重複提交會覆蓋更新)
-
-需要的 Streamlit secrets(在 App 設定的 Secrets 分頁貼入)：
-
-    drive_folder_id = "你的 Google Drive 資料夾 ID"
-
-    [gcp_service_account]
-    type = "service_account"
-    project_id = "..."
-    private_key_id = "..."
-    private_key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
-    client_email = "mingo-lin-greenharvest-com-tw@adept-eon-496404-t4.iam.gserviceaccount.comm"
-    client_id = "..."
-    token_uri = "https://oauth2.googleapis.com/token"
-
-    (把下載到的 .json 金鑰檔內容，轉成上面這種 TOML 格式貼進去即可；
-     private_key 裡的換行請保留 \n)
-------------------------------------------------
-"""
-
-import json
-from io import BytesIO
-
 import streamlit as st
-import fitz  # PyMuPDF
-from PIL import Image
-from google.cloud import vision
+import json
+import io
+import mimetypes
+from drive_utils import (
+    get_drive_service,
+    find_or_create_folder,
+    upload_file_from_bytes,
+    search_file,
+    download_file_bytes,
+    upload_or_update_xlsx,
+)
+from vision_utils import extract_data_from_image
+from master_utils import (
+    json_to_excel_bytes,
+    append_json_to_existing_excel_bytes,
+    excel_bytes_to_json,
+)
 
-from drive_utils import get_drive_service, find_or_create_folder, find_file_id, download_file_bytes, upload_or_update_xlsx
-from vision_utils import crop_field, ocr_text, is_checked
-from master_utils import build_columns, record_filename, append_row_to_workbook, upsert_row_in_summary, build_row_dict
+# 頁面標題與配置
+st.set_page_config(page_title="供應商資料辨識與主檔管理系統", layout="wide")
 
-st.set_page_config(page_title="供應商資料表 PDF 辨識工具", page_icon="🧾", layout="wide")
-
-RENDER_DPI = 200  # 必須跟 template.json 校正時使用的 DPI 一致
-
-
-@st.cache_data
-def load_template():
-    with open("template.json", encoding="utf-8") as f:
-        return json.load(f)
-
-
-@st.cache_resource
-def get_vision_client():
-    creds_info = dict(st.secrets["gcp_service_account"])
-    from google.oauth2 import service_account
-    creds = service_account.Credentials.from_service_account_info(creds_info)
-    return vision.ImageAnnotatorClient(credentials=creds)
-
-
-@st.cache_resource
-def get_drive():
-    creds_info = dict(st.secrets["gcp_service_account"])
-    return get_drive_service(creds_info)
-
-
-def pdf_to_image(pdf_bytes: bytes, dpi: int = RENDER_DPI) -> Image.Image:
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page = doc[0]  # 假設表格都在第一頁
-    zoom = dpi / 72
-    mat = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat)
-    return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-
-
-def run_extraction(page_image, template, vision_client):
-    """對整份表格跑一次辨識，回傳 {欄位名: 建議值} 的字典，供畫面顯示與人工核對。"""
-    suggestions = {}
-    crops = {}
-    for field in template["fields"]:
-        if field["type"] == "text":
-            crop = crop_field(page_image, field["box"])
-            crops[field["name"]] = crop
-            try:
-                suggestions[field["name"]] = ocr_text(vision_client, crop)
-            except Exception as e:
-                suggestions[field["name"]] = ""
-                st.warning(f"「{field['name']}」辨識失敗：{e}")
-        elif field["type"] == "checkbox_single":
-            crop = crop_field(page_image, field["box"])
-            crops[field["name"]] = crop
-            checked, ratio = is_checked(page_image, field["box"])
-            suggestions[field["name"]] = "是" if checked else "否"
-        elif field["type"] == "checkbox_group":
-            best_label, best_ratio = None, 0
-            option_crops = []
-            for opt in field["options"]:
-                crop = crop_field(page_image, opt["box"])
-                option_crops.append((opt["label"], crop))
-                checked, ratio = is_checked(page_image, opt["box"])
-                if checked and ratio > best_ratio:
-                    best_label, best_ratio = opt["label"], ratio
-            crops[field["name"]] = option_crops
-            suggestions[field["name"]] = best_label or ""
-    return suggestions, crops
-
+def load_master_schema():
+    """載入主檔欄位結構定義范本 (template.json)"""
+    default_schema = {
+        "供應商名稱": None,
+        "統一編號": None,
+        "負責人": None,
+        "聯絡電話": None,
+        "電子郵件": None,
+        "地址": None,
+        "銀行帳號": None,
+        "建立日期": None,
+    }
+    try:
+        with open("template.json", "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default_schema
 
 def main():
-    st.title("🧾 供應商資料表 PDF 掃描辨識工具")
-    st.caption("上傳掃描好的供應商資料表 PDF，自動辨識後請核對，確認無誤再存檔。")
+    st.title("📄 供應商表單 / 圖片辨識與主檔自動寫入系統")
+    st.markdown("支援 PDF 檔案以及 **PNG、JPG、JPEG 圖片/照片** 自動辨識並整合寫入 Google Drive Excel 主檔。")
 
-    with st.expander("🔧 Secrets 診斷工具(排除問題用，確認沒問題後可以刪掉這段)"):
-        try:
-            info = dict(st.secrets["gcp_service_account"])
-            pk = info.get("private_key", "")
-            st.write("client_email:", repr(info.get("client_email", "")))
-            st.write("project_id:", repr(info.get("project_id", "")))
-            st.write("private_key_id:", repr(info.get("private_key_id", "")))
-            st.write("client_id:", repr(info.get("client_id", "")))
-            st.write("token_uri:", repr(info.get("token_uri", "")))
-            st.write("private_key 開頭 20 字元:", repr(pk[:20]))
-            st.write("private_key 結尾 20 字元:", repr(pk[-20:]))
-            st.write("private_key 總長度:", len(pk))
-            st.write("private_key 裡「真的換行符號」數量:", pk.count("\n"))
-            st.write("private_key 裡「反斜線+n 兩個字元」數量:", pk.count("\\n"))
-            st.write("drive_folder_id:", repr(st.secrets.get("drive_folder_id", "")))
-        except Exception as e:
-            st.error(f"讀取 Secrets 時發生錯誤：{e}")
+    # 1. 初始化 Google Drive 服務與基礎參數
+    try:
+        service = get_drive_service()
+        drive_folder_id = st.secrets.get("drive_folder_id")
+        if not drive_folder_id:
+            st.error("❌ 尚未在 Secrets 中設定 `drive_folder_id`。")
+            st.stop()
+    except Exception as e:
+        st.error(f"❌ Google Drive 初始化失敗: {e}")
+        st.stop()
 
-    template = load_template()
-    columns = build_columns(template)
+    # 2. 準備主檔 Schema
+    master_schema = load_master_schema()
 
-    uploaded_pdf = st.file_uploader("上傳已掃描的供應商資料表(PDF，一次一份)", type=["pdf"])
+    # 3. 檔案上傳區塊 (支援圖片與 PDF)
+    st.subheader("1. 上傳表單或照片")
+    uploaded_file = st.file_uploader(
+        "請選擇或拖曳供應商文件/照片 (支援 PNG, JPG, JPEG, PDF)",
+        type=["png", "jpg", "jpeg", "pdf"]
+    )
 
-    if uploaded_pdf is not None:
-        pdf_bytes = uploaded_pdf.getvalue()
+    if uploaded_file is not None:
+        file_bytes = uploaded_file.getvalue()
+        file_name = uploaded_file.name
+        mime_type = uploaded_file.type or mimetypes.guess_type(file_name)[0]
 
-        if st.session_state.get("_current_file") != uploaded_pdf.name:
-            # 換了一份新檔案，清掉之前的暫存結果
-            st.session_state["_current_file"] = uploaded_pdf.name
-            st.session_state.pop("_suggestions", None)
-            st.session_state.pop("_crops", None)
-
-        if "_suggestions" not in st.session_state:
-            with st.spinner("辨識中，請稍候(掃描頁面較多或網路較慢時可能需要一點時間)..."):
-                page_image = pdf_to_image(pdf_bytes)
-                vision_client = get_vision_client()
-                suggestions, crops = run_extraction(page_image, template, vision_client)
-                st.session_state["_suggestions"] = suggestions
-                st.session_state["_crops"] = crops
-                st.session_state["_page_image"] = page_image
-
-        st.success("辨識完成，請逐一核對下方內容，確認或修正後再送出。")
         st.divider()
+        col1, col2 = st.columns([1, 1])
 
-        edited = {}
-        for field in template["fields"]:
-            name = field["name"]
-            col_img, col_val = st.columns([1, 2])
+        # 顯示圖片預覽
+        with col1:
+            st.subheader("📷 上傳檔案預覽")
+            if mime_type in ["image/png", "image/jpeg", "image/jpg"]:
+                st.image(uploaded_file, use_container_width=True, caption=file_name)
+            elif mime_type == "application/pdf":
+                st.info(f"📄 已選擇 PDF 文件：{file_name}")
 
-            if field["type"] == "text":
-                with col_img:
-                    st.image(st.session_state["_crops"][name], use_container_width=True)
-                with col_val:
-                    edited[name] = st.text_input(name, value=st.session_state["_suggestions"][name], key=f"in_{name}")
+        # 進行雲端備份與 AI 辨識
+        with col2:
+            st.subheader("🤖 AI 欄位辨識結果")
 
-            elif field["type"] == "checkbox_single":
-                with col_img:
-                    st.image(st.session_state["_crops"][name], use_container_width=True)
-                with col_val:
-                    default_yes = st.session_state["_suggestions"][name] == "是"
-                    edited[name] = "是" if st.checkbox(name, value=default_yes, key=f"in_{name}") else "否"
+            # Step 1: 自動建立/尋找資料夾並備份原檔
+            with st.spinner("☁️ 正在上傳檔案備份至 Google Drive..."):
+                try:
+                    target_folder_id = find_or_create_folder(
+                        service=service,
+                        parent_folder_id=drive_folder_id,
+                        folder_name="供應商主檔"
+                    )
+                    upload_file_from_bytes(
+                        service=service,
+                        file_bytes=file_bytes,
+                        file_name=file_name,
+                        parent_folder_id=target_folder_id,
+                        mime_type=mime_type
+                    )
+                    st.success("✅ 原始檔案已備份至雲端資料夾！")
+                except Exception as e:
+                    st.error(f"❌ 檔案備份失敗: {e}")
 
-            elif field["type"] == "checkbox_group":
-                option_labels = [o["label"] for o in field["options"]]
-                suggested = st.session_state["_suggestions"][name]
-                with col_img:
-                    thumb_cols = st.columns(len(st.session_state["_crops"][name]))
-                    for tc, (label, crop) in zip(thumb_cols, st.session_state["_crops"][name]):
-                        with tc:
-                            st.image(crop, caption=label, use_container_width=True)
-                with col_val:
-                    default_idx = option_labels.index(suggested) if suggested in option_labels else 0
-                    edited[name] = st.radio(name, option_labels, index=default_idx, key=f"in_{name}", horizontal=True)
+            # Step 2: 若為圖片，進行 Vision API 自動辨識
+            extracted_data = {}
+            if mime_type in ["image/png", "image/jpeg", "image/jpg"]:
+                with st.spinner("🔍 正在使用 AI Vision 辨識圖片內容..."):
+                    extracted_data = extract_data_from_image(
+                        image_bytes=file_bytes,
+                        mime_type=mime_type,
+                        master_schema=master_schema
+                    )
 
-            st.divider()
+                if extracted_data:
+                    st.success("✅ 辨識完成！請確認下方欄位內容：")
+                    # 可供使用者確認與手動修正 AI 辨識出的結果
+                    edited_data = {}
+                    for k, v in extracted_data.items():
+                        edited_data[k] = st.text_input(label=f"【{k}】", value="" if v is None else str(v))
 
-        if st.button("✅ 確認並存檔", type="primary"):
-            with st.spinner("寫入 Google Drive 中..."):
-                drive_folder_id = st.secrets["drive_folder_id"]
-                service = get_drive()
+                    # Step 3: 確認寫入主檔 Excel 按鈕
+                    if st.button("💾 確認資料並寫入/更新雲端 Excel 主檔", type="primary"):
+                        with st.spinner("📊 正在更新雲端 Excel 主檔..."):
+                            master_filename = "供應商資料主檔.xlsx"
+                            
+                            # 搜尋雲端是否已有 Excel 主檔
+                            existing_file = search_file(service, target_folder_id, master_filename)
 
-                supplier_folder_id = find_or_create_folder(service, drive_folder_id, "供應商主檔")
+                            if existing_file:
+                                file_id = existing_file["id"]
+                                existing_bytes = download_file_bytes(service, file_id)
+                                new_excel_bytes = append_json_to_existing_excel_bytes(
+                                    existing_excel_bytes=existing_bytes,
+                                    new_data=edited_data
+                                )
+                            else:
+                                new_excel_bytes = json_to_excel_bytes(extracted_data=edited_data)
 
-                row = build_row_dict(uploaded_pdf.name, edited)
+                            # 更新/上傳主檔至 Google Drive
+                            upload_or_update_xlsx(
+                                service=service,
+                                folder_id=target_folder_id,
+                                file_name=master_filename,
+                                xlsx_bytes=new_excel_bytes
+                            )
+                            st.balloons()
+                            st.success("🎉 資料已成功 append 寫入並更新至雲端『供應商資料主檔.xlsx』！")
 
-                # 1) 該供應商自己的主檔(新增一列，形成歷史紀錄)
-                fname = record_filename(edited)
-                existing_id = find_file_id(service, supplier_folder_id, fname)
-                existing_bytes = download_file_bytes(service, existing_id) if existing_id else None
-                new_bytes = append_row_to_workbook(existing_bytes, columns, row)
-                upload_or_update_xlsx(service, supplier_folder_id, fname, new_bytes)
+            else:
+                st.info("ℹ️ 提示：目前自動辨識功能主要針對 PNG / JPG / JPEG 圖片格式。")
 
-                # 2) 彙總總表(同一家供應商覆蓋更新那一列)
-                summary_name = "彙總總表.xlsx"
-                summary_id = find_file_id(service, drive_folder_id, summary_name)
-                summary_bytes = download_file_bytes(service, summary_id) if summary_id else None
-                new_summary_bytes = upsert_row_in_summary(summary_bytes, columns, row)
-                upload_or_update_xlsx(service, drive_folder_id, summary_name, new_summary_bytes)
+    st.divider()
 
-            st.success(f"已存檔！供應商主檔：{fname}，並已同步更新彙總總表。")
-            st.balloons()
-            for k in ["_suggestions", "_crops", "_page_image", "_current_file"]:
-                st.session_state.pop(k, None)
-
+    # 4. 檢視雲端主檔 Excel 內容
+    st.subheader("📊 雲端『供應商資料主檔.xlsx』線上檢視")
+    if st.button("🔄 載入/重新整理雲端主檔資料"):
+        with st.spinner("📥 正在從 Google Drive 讀取主檔..."):
+            try:
+                target_folder_id = find_or_create_folder(service, drive_folder_id, "供應商主檔")
+                existing_file = search_file(service, target_folder_id, "供應商資料主檔.xlsx")
+                if existing_file:
+                    excel_bytes = download_file_bytes(service, existing_file["id"])
+                    records = excel_bytes_to_json(excel_bytes)
+                    st.dataframe(records, use_container_width=True)
+                else:
+                    st.warning("⚠️ 目前雲端上尚未存在『供應商資料主檔.xlsx』，請先上傳資料並寫入。")
+            except Exception as e:
+                st.error(f"❌ 讀取主檔失敗: {e}")
 
 if __name__ == "__main__":
     main()

@@ -1,99 +1,89 @@
-"""
-主檔存取邏輯
-------------------------------------------------
-- 每個供應商自己的主檔：每次上傳/核對確認後「新增一列」，天然形成該供應商的歷史紀錄
-  (方便日後追蹤:這家供應商什麼時候更新過資料、改了什麼)。
-- 彙總總表：每個供應商永遠只有「一列」，用統一編號/身份證號當作 key，
-  同一家供應商重新上傳後會覆蓋更新那一列，而不是一直往下新增重複列，方便搜尋/篩選。
-------------------------------------------------
-"""
+import io
+import pandas as pd
+from typing import Dict, Any, List
 
-from io import BytesIO
-from datetime import datetime
-
-from openpyxl import Workbook, load_workbook
-
-
-def build_columns(template: dict):
-    columns = []
-    for f in template["fields"]:
-        columns.append(f["name"])
-    return columns
-
-
-def record_filename(record: dict) -> str:
-    supplier_id = record.get("統一編號/身份證號", "").strip()
-    company = record.get("公司全名(中文)", "").strip()
-    key = supplier_id or company or "未命名供應商"
-    safe = "".join(c for c in key if c not in '\\/:*?"<>|')
-    if supplier_id and company:
-        return f"{supplier_id}_{company}.xlsx"
-    return f"{safe}.xlsx"
-
-
-def append_row_to_workbook(existing_bytes, columns, row_dict) -> bytes:
-    """把一列資料附加到既有的 Excel 內容後面(沒有就新建)，回傳新的檔案位元組資料。"""
-    full_columns = ["_來源檔案", "_處理時間"] + columns
-    if existing_bytes:
-        wb = load_workbook(BytesIO(existing_bytes))
-        ws = wb.active
-    else:
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "資料"
-        ws.append(full_columns)
-
-    ws.append([row_dict.get(col, "") for col in full_columns])
-
-    out = BytesIO()
-    wb.save(out)
-    return out.getvalue()
-
-
-def upsert_row_in_summary(existing_bytes, columns, row_dict, key_column="統一編號/身份證號") -> bytes:
+def json_to_excel_bytes(extracted_data: Dict[str, Any], sheet_name: str = "供應商資料主檔") -> bytes:
     """
-    彙總總表：用 key_column 判斷這家供應商是不是已經有資料了。
-    有 -> 覆蓋整列；沒有 -> 新增一列。
+    將 AI 辨識回傳的 JSON / Dict 資料轉換為 Excel 檔案 (bytes)
+    
+    :param extracted_data: AI 辨識出的 JSON 資料字典
+    :param sheet_name: Excel 工作表名稱
+    :return: 包含 Excel 內容的 bytes
     """
-    full_columns = ["_來源檔案", "_處理時間"] + columns
-    key_value = row_dict.get(key_column, "")
-
-    if existing_bytes:
-        wb = load_workbook(BytesIO(existing_bytes))
-        ws = wb.active
-        headers = [c.value for c in ws[1]]
-        if headers != full_columns:
-            # 欄位結構跟現在的 schema 不一致(例如模板改版新增了欄位)
-            # 仍然依欄位名稱對應寫入，避免資料寫到錯的欄位去
-            pass
-        key_col_idx = headers.index(key_column) + 1 if key_column in headers else None
-        target_row = None
-        if key_col_idx and key_value:
-            for r in range(2, ws.max_row + 1):
-                if ws.cell(row=r, column=key_col_idx).value == key_value:
-                    target_row = r
-                    break
-        if target_row:
-            for idx, col in enumerate(headers, start=1):
-                ws.cell(row=target_row, column=idx, value=row_dict.get(col, ""))
+    # 展平字典結構（若有巢狀 JSON 則拉平）
+    flat_data = {}
+    for key, value in extracted_data.items():
+        if isinstance(value, dict):
+            for sub_key, sub_value in value.items():
+                flat_data[f"{key}_{sub_key}"] = sub_value
+        elif isinstance(value, list):
+            flat_data[key] = ", ".join(map(str, value))
         else:
-            ws.append([row_dict.get(col, "") for col in headers])
-    else:
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "供應商彙總總表"
-        ws.append(full_columns)
-        ws.append([row_dict.get(col, "") for col in full_columns])
+            flat_data[key] = value
 
-    out = BytesIO()
-    wb.save(out)
-    return out.getvalue()
+    # 轉為 Pandas DataFrame (單筆記錄列)
+    df = pd.DataFrame([flat_data])
+
+    # 輸出至記憶體 bytes 流
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+    
+    return output.getvalue()
 
 
-def build_row_dict(source_filename: str, extracted: dict) -> dict:
-    row = {
-        "_來源檔案": source_filename,
-        "_處理時間": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    row.update(extracted)
-    return row
+def append_json_to_existing_excel_bytes(
+    existing_excel_bytes: bytes, 
+    new_data: Dict[str, Any], 
+    sheet_name: str = "供應商資料主檔"
+) -> bytes:
+    """
+    將新的辨識資料追加 (Append) 到既有的 Excel 檔案中
+    
+    :param existing_excel_bytes: 既有 Excel 的 bytes
+    :param new_data: 新的辨識 JSON 資料
+    :param sheet_name: Excel 工作表名稱
+    :return: 更新後的 Excel bytes
+    """
+    # 展平新資料
+    flat_data = {}
+    for key, value in new_data.items():
+        if isinstance(value, dict):
+            for sub_key, sub_value in value.items():
+                flat_data[f"{key}_{sub_key}"] = sub_value
+        elif isinstance(value, list):
+            flat_data[key] = ", ".join(map(str, value))
+        else:
+            flat_data[key] = value
+
+    # 讀取既有 Excel 內容
+    try:
+        existing_df = pd.read_excel(io.BytesIO(existing_excel_bytes), sheet_name=sheet_name)
+    except Exception:
+        existing_df = pd.DataFrame()
+
+    new_df = pd.DataFrame([flat_data])
+
+    # 合併新舊資料
+    updated_df = pd.concat([existing_df, new_df], ignore_index=False, sort=False)
+
+    # 輸出更新後的 Excel bytes
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        updated_df.to_excel(writer, index=False, sheet_name=sheet_name)
+
+    return output.getvalue()
+
+
+def excel_bytes_to_json(excel_bytes: bytes, sheet_name: str = "供應商資料主檔") -> List[Dict[str, Any]]:
+    """
+    讀取 Excel 檔案內容並轉換回 JSON List 格式
+    
+    :param excel_bytes: Excel 的 bytes
+    :param sheet_name: 工作表名稱
+    :return: JSON 陣列資料
+    """
+    df = pd.read_excel(io.BytesIO(excel_bytes), sheet_name=sheet_name)
+    # 將 NaN 轉為 None/null 以利 JSON 處理
+    df = df.where(pd.notnull(df), None)
+    return df.to_dict(orient='records')

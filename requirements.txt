@@ -1,10 +1,9 @@
 streamlit
-google-api-python-client
-google-auth
-google-auth-httplib2
-google-auth-oauthlib
-google-generativeai
+google-genai
 pandas
 openpyxl
-PyMuPDF
+pymupdf
 python-docx
+Pillow
+google-api-python-client
+google-auth

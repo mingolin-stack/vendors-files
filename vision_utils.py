@@ -1,44 +1,84 @@
-import base64
+import os
+import io
+import fitz  # PyMuPDF
+import docx
+import pandas as pd
 import json
-import streamlit as st
+import base64
 from openai import OpenAI
+import streamlit as st
 
-def encode_image_to_base64(image_bytes: bytes) -> str:
-    """將圖片 bytes 轉換為 Base64 字串"""
-    return base64.b64encode(image_bytes).decode('utf-8')
+def extract_content_from_file(file_bytes: bytes, file_ext: str):
+    """根據副檔名提文字或轉成圖片 bytes"""
+    file_ext = file_ext.lower()
+    
+    if file_ext == ".pdf":
+        # 將 PDF 第一頁轉為 PNG 圖片
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        if len(doc) == 0:
+            raise ValueError("上傳的 PDF 檔案為空檔")
+        page = doc[0]
+        pix = page.get_pixmap(dpi=200)
+        return "image", pix.tobytes("png")
 
-def extract_data_from_image(image_bytes: bytes, mime_type: str, master_schema: dict) -> dict:
-    """
-    使用 Vision LLM (GPT-4o) 讀取表單圖片，並根據 master_schema 的欄位定義自動擷取寫入資料。
+    elif file_ext in [".docx", ".doc"]:
+        # 提取 Word 文件中的文字與表格
+        doc = docx.Document(io.BytesIO(file_bytes))
+        full_text = []
+        for p in doc.paragraphs:
+            if p.text.strip():
+                full_text.append(p.text.strip())
+        for table in doc.tables:
+            for row in table.rows:
+                row_data = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                if row_data:
+                    full_text.append(" | ".join(row_data))
+        return "text", "
+".join(full_text)
 
-    :param image_bytes: 上傳圖片的位元組資料
-    :param mime_type: 圖片 MIME 類型 (例如 'image/png', 'image/jpeg')
-    :param master_schema: 定義好的欄位 JSON 結構範本
-    :return: 擷取對應後的 JSON 資料
-    """
-    # 從 secrets 取得 API 金鑰
+    elif file_ext in [".xlsx", ".xls"]:
+        # 讀取 Excel 並轉為 CSV 文字字串
+        df_dict = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None)
+        all_sheets_text = []
+        for sheet_name, df in df_dict.items():
+            all_sheets_text.append(f"--- Sheet: {sheet_name} ---")
+            all_sheets_text.append(df.to_csv(index=False))
+        return "text", "
+".join(all_sheets_text)
+
+    else:
+        raise ValueError(f"不支援的檔案格式: {file_ext}")
+
+
+def analyze_vendor_document(file_bytes: bytes, file_ext: str) -> dict:
+    """分析 Word, Excel, PDF 文件並提取供應商欄位資訊"""
     api_key = st.secrets.get("OPENAI_API_KEY")
     if not api_key:
-        st.error("❌ 未設定 OPENAI_API_KEY，請在 Streamlit Secrets 設定中新增。")
-        return {}
+        raise ValueError("未設定 OPENAI_API_KEY，請在 Streamlit Secrets 設定中新增。")
 
     client = OpenAI(api_key=api_key)
-    base64_image = encode_image_to_base64(image_bytes)
+    content_type, extracted_content = extract_content_from_file(file_bytes, file_ext)
 
-    prompt = f"""
-    你是一個專業的文件與表單欄位辨識專家。
-    請詳細分析這張表單圖片，讀取使用者在空白處填寫的內容。
+    prompt = """
+    請幫我辨識這份供應商資料文件的內容，並以 JSON 格式回傳以下欄位：
+    - 公司全名
+    - 統一編號
+    - 負責人
+    - 聯絡人
+    - 公司電話
+    - 聯絡電話
+    - 聯絡地址
+    - 帳單地址
+    - 匯款帳號戶名
+    - 匯款銀行
+    - 分行別
+    - 匯款帳號
 
-    請務必回傳嚴格符合以下結構的 JSON 格式，不要包含 Markdown 標記或額外說明：
-    {json.dumps(master_schema, ensure_ascii=False, indent=2)}
-
-    說明規範：
-    1. 尋找圖片中與 Schema 欄位標籤名稱對應的填寫文字。
-    2. 若欄位空白、無法辨識或未填寫，請將其值填入 null。
-    3. 日期欄位請格式化為 YYYY-MM-DD（若可解析）。
+    若欄位不存在或無法辨識，請填寫 ""。僅回傳純 JSON 字串，不要包含任何 markdown 標籤。
     """
 
-    try:
+    if content_type == "image":
+        base64_image = base64.b64encode(extracted_content).decode('utf-8')
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=[
@@ -49,19 +89,31 @@ def extract_data_from_image(image_bytes: bytes, mime_type: str, master_schema: d
                         {
                             "type": "image_url",
                             "image_url": {
-                                "url": f"data:{mime_type};base64,{base64_image}"
+                                "url": f"data:image/png;base64,{base64_image}"
                             },
                         },
                     ],
                 }
             ],
-            response_format={"type": "json_object"},
-            temperature=0.1
+            max_tokens=1000,
+        )
+    else:
+        user_message = f"{prompt}
+
+以下是文件的內容資料：
+{extracted_content}"
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "user", "content": user_message}
+            ],
+            max_tokens=1000,
         )
 
-        result_text = response.choices[0].message.content
-        return json.loads(result_text)
+    result_text = response.choices[0].message.content.strip()
+    if result_text.startswith("```json"):
+        result_text = result_text[7:]
+    if result_text.endswith("```"):
+        result_text = result_text[:-3]
 
-    except Exception as e:
-        st.error(f"❌ 圖片 AI 辨識發生錯誤: {e}")
-        return {}
+    return json.loads(result_text.strip())

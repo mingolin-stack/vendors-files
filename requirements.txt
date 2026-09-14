@@ -3,7 +3,7 @@ google-api-python-client
 google-auth
 google-auth-httplib2
 google-auth-oauthlib
-openai
+google-generativeai
 pandas
 openpyxl
 PyMuPDF

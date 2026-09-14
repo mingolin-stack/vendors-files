@@ -1,8 +1,7 @@
 streamlit
-PyMuPDF
-Pillow
-numpy
-openpyxl
-google-cloud-vision
 google-api-python-client
-google-auth
+google-auth-httplib2
+google-auth-oauthlib
+openai
+pandas
+openpyxl

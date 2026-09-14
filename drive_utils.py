@@ -42,11 +42,11 @@ def get_drive_service():
         raise e
 
 
-def find_or_create_folder(service, parent_id: str, folder_name: str) -> Optional[str]:
+def find_or_create_folder(service, parent_folder_id: str, folder_name: str) -> Optional[str]:
     """尋找指定父資料夾下的同名資料夾；若不存在則建立"""
     safe_folder_name = folder_name.replace("'", "\\'")
     query = (
-        f"'{parent_id}' in parents and "
+        f"'{parent_folder_id}' in parents and "
         f"name = '{safe_folder_name}' and "
         f"mimeType = 'application/vnd.google-apps.folder' and "
         f"trashed = false"
@@ -71,7 +71,7 @@ def find_or_create_folder(service, parent_id: str, folder_name: str) -> Optional
         folder_metadata = {
             "name": folder_name,
             "mimeType": "application/vnd.google-apps.folder",
-            "parents": [parent_id],
+            "parents": [parent_folder_id],
         }
         folder = (
             service.files()
@@ -86,11 +86,11 @@ def find_or_create_folder(service, parent_id: str, folder_name: str) -> Optional
         raise error
 
 
-def find_file_id(service, parent_id: str, file_name: str) -> Optional[str]:
-    """在指定資料夾中搜尋檔案 ID"""
+def search_file(service, parent_folder_id: str, file_name: str) -> Optional[Dict[str, str]]:
+    """在指定資料夾中搜尋檔案並回傳包含 id 與 name 的字典"""
     safe_file_name = file_name.replace("'", "\\'")
     query = (
-        f"'{parent_id}' in parents and "
+        f"'{parent_folder_id}' in parents and "
         f"name = '{safe_file_name}' and "
         f"trashed = false"
     )
@@ -106,14 +106,14 @@ def find_file_id(service, parent_id: str, file_name: str) -> Optional[str]:
             .execute(num_retries=NUM_RETRIES)
         )
         files = results.get("files", [])
-        return files[0]["id"] if files else None
+        return files[0] if files else None
     except HttpError as error:
         handle_http_error(error, f"搜尋檔案 '{file_name}'")
         raise error
 
 
 def download_file_bytes(service, file_id: str) -> bytes:
-    """根據 file_id 下載雲端檔案並回傳 bytes 資料"""
+    """根據 file_id 下載雲端檔案內容」"""
     try:
         request = service.files().get_media(fileId=file_id)
         file_stream = io.BytesIO()
@@ -127,22 +127,60 @@ def download_file_bytes(service, file_id: str) -> bytes:
         raise error
 
 
-def upload_or_update_xlsx(service, parent_folder_id: str, file_name: str, file_bytes: bytes) -> str:
-    """若指定名稱的 XLSX 存在則更新，若不存在則新建檔案"""
-    existing_file_id = find_file_id(service, parent_folder_id, file_name)
+def upload_file_from_bytes(
+    service,
+    file_bytes: bytes,
+    file_name: str,
+    parent_folder_id: str,
+    mime_type: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """上傳檔案 bytes 至 Google Drive 資料夾"""
+    if not mime_type:
+        mime_type, _ = mimetypes.guess_type(file_name)
+        if mime_type is None:
+            mime_type = "application/octet-stream"
+
+    file_metadata = {
+        "name": file_name,
+        "parents": [parent_folder_id]
+    }
+    media_stream = io.BytesIO(file_bytes)
+
+    try:
+        media = MediaIoBaseUpload(
+            media_stream, mimetype=mime_type, resumable=True
+        )
+        uploaded_file = (
+            service.files()
+            .create(
+                body=file_metadata,
+                media_body=media,
+                fields="id, name, webViewLink, webContentLink",
+                supportsAllDrives=True
+            )
+            .execute(num_retries=NUM_RETRIES)
+        )
+        return uploaded_file
+    except HttpError as error:
+        handle_http_error(error, f"上傳檔案 '{file_name}'")
+        raise error
+
+
+def upload_or_update_xlsx(service, folder_id: str, file_name: str, xlsx_bytes: bytes) -> str:
+    """新建或覆蓋更新 Excel 主檔"""
+    existing_file = search_file(service, folder_id, file_name)
     media = MediaIoBaseUpload(
-        io.BytesIO(file_bytes),
+        io.BytesIO(xlsx_bytes),
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         resumable=True
     )
 
     try:
-        if existing_file_id:
-            # 存在舊檔 -> 更新內容
+        if existing_file:
             updated_file = (
                 service.files()
                 .update(
-                    fileId=existing_file_id,
+                    fileId=existing_file["id"],
                     media_body=media,
                     fields="id",
                     supportsAllDrives=True
@@ -151,10 +189,9 @@ def upload_or_update_xlsx(service, parent_folder_id: str, file_name: str, file_b
             )
             return updated_file.get("id")
         else:
-            # 不存在舊檔 -> 新增檔案
             file_metadata = {
                 "name": file_name,
-                "parents": [parent_folder_id]
+                "parents": [folder_id]
             }
             new_file = (
                 service.files()

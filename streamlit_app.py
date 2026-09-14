@@ -105,7 +105,7 @@ def analyze_vendor_document(file_bytes: bytes, file_ext: str) -> dict:
         raise ValueError("未設定 GEMINI_API_KEY，請在 Streamlit Secrets 設定中新增。")
 
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    model = genai.GenerativeModel("models/gemini-1.5-flash")
 
     content_type, extracted_content = extract_content_from_file(file_bytes, file_ext)
 

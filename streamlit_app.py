@@ -154,8 +154,6 @@ with col2:
                     ])
                     
                     raw_text = response.text.strip()
-                    # 使用不需要跳脫的非貪婪匹配，徹底避開 
- 造成的跨行 SyntaxError
                     cleaned_text = re.sub(r"^```[a-zA-Z]*", "", raw_text)
                     cleaned_text = re.sub(r"```$", "", cleaned_text).strip()
                     

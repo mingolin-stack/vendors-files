@@ -155,10 +155,8 @@ with col2:
                     ])
                     
                     raw_text = response.text.strip()
-                    cleaned_text = re.sub(r"^```[a-zA-Z]*
-?", "", raw_text)
-                    cleaned_text = re.sub(r"
-?```$", "", cleaned_text).strip()
+                   cleaned_text = re.sub(r"^```[a-zA-Z]*\n?", "", raw_text)
+cleaned_text = re.sub(r"\n?```$", "", cleaned_text).strip()
                     
                     parsed_json = json.loads(cleaned_text)
                     st.session_state[file_key] = parsed_json

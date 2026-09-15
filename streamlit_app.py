@@ -23,21 +23,25 @@ if not api_key:
 genai.configure(api_key=api_key)
 
 def get_working_model():
-    """動態取得目前 API Key 支援的最佳可用模型，避免 hardcode 模型名稱退役或權限不足問題"""
+    """動態取得目前 API Key 支援的最佳可用模型，過濾已棄用版本"""
     try:
+        # 列出所有可用的 generateContent 模型，並過濾掉明確標註 deprecated 的模型
         available_models = [
             m.name for m in genai.list_models() 
-            if 'generateContent' in m.supported_generation_methods
+            if 'generateContent' in m.supported_generation_methods and 'deprecated' not in m.name.lower()
         ]
         
-        # 1. 優先選擇名稱包含 'flash' 的最新模型 (速度快且成本低)
+        # 1. 優先選擇名稱包含 'flash' 且版本較新的模型
         flash_models = [m for m in available_models if 'flash' in m.lower()]
         if flash_models:
+            # 排序讓最新版本的 flash 排序在前
+            flash_models.sort(reverse=True)
             return genai.GenerativeModel(flash_models[0])
             
         # 2. 次要選擇包含 'pro' 的模型
         pro_models = [m for m in available_models if 'pro' in m.lower()]
         if pro_models:
+            pro_models.sort(reverse=True)
             return genai.GenerativeModel(pro_models[0])
             
         # 3. 備援：使用第一個可用模型
@@ -46,8 +50,8 @@ def get_working_model():
     except Exception:
         pass
         
-    # 極致預設備援
-    return genai.GenerativeModel("gemini-1.5-flash-latest")
+    # 極致預設備援（指定最新推薦版本）
+    return genai.GenerativeModel("gemini-3.6-flash")
 
 def get_drive_service():
     if "gcp_service_account" in st.secrets:
@@ -153,7 +157,7 @@ with col2:
         if file_key not in st.session_state:
             with st.spinner("AI 正在辨識文件、服務範疇與匯款資訊..."):
                 try:
-                    # 使用動態偵測機制取得可用模型
+                    # 使用自動偵測最佳模型
                     model = get_working_model()
                     bytes_data = uploaded_file.getvalue()
                     
